@@ -1,6 +1,8 @@
 package io.github.satyaprakashdwivedi.streaming.runtime;
 
 import io.github.satyaprakashdwivedi.streaming.PipelineException;
+import io.github.satyaprakashdwivedi.streaming.api.MultiOutputTransform;
+import io.github.satyaprakashdwivedi.streaming.api.Transform;
 import io.github.satyaprakashdwivedi.streaming.config.PipelineConfig;
 import io.github.satyaprakashdwivedi.streaming.config.StepConfig;
 import io.github.satyaprakashdwivedi.streaming.registry.ComponentRegistry;
@@ -65,12 +67,18 @@ public final class PipelineRunner {
                 }
             }
             kinds.put(step.name(), kind);
+            plan.add(step.name() + " [" + step.type() + "]" + (input == null ? "" : " <- " + input));
+            if (kind.equals("transform") && registry.transform(step.type()) instanceof MultiOutputTransform) {
+                for (String extra : ((MultiOutputTransform) registry.transform(step.type())).extraOutputNames(step)) {
+                    kinds.put(step.name() + "_" + extra, kind);
+                    plan.add(step.name() + "_" + extra + " [extra output of " + step.name() + "]");
+                }
+            }
             if (kind.equals("sink")) {
                 sawSink = true;
             } else {
                 previous = step.name();
             }
-            plan.add(step.name() + " [" + step.type() + "]" + (input == null ? "" : " <- " + input));
         }
         if (!sawSink) {
             throw new PipelineException("Pipeline has no sink step: nothing would run. Add e.g. type = sink.console");
@@ -109,8 +117,18 @@ public final class PipelineRunner {
                     }
                     case "transform": {
                         String in = step.input().orElse(previous);
-                        Dataset<Row> df = registry.transform(step.type()).apply(spark, outputs.get(in), step);
-                        register(step.name(), df, outputs);
+                        Transform transform = registry.transform(step.type());
+                        if (transform instanceof MultiOutputTransform) {
+                            Map<String, Dataset<Row>> results = ((MultiOutputTransform) transform)
+                                    .applyWithExtraOutputs(spark, outputs.get(in), step);
+                            for (Map.Entry<String, Dataset<Row>> result : results.entrySet()) {
+                                String outputName = result.getKey().isEmpty() ? step.name()
+                                        : step.name() + "_" + result.getKey();
+                                register(outputName, result.getValue(), outputs);
+                            }
+                        } else {
+                            register(step.name(), transform.apply(spark, outputs.get(in), step), outputs);
+                        }
                         previous = step.name();
                         break;
                     }

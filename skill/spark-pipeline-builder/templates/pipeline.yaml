@@ -1,0 +1,52 @@
+# Spark streaming pipeline template: fill in the blanks, delete what you don't need.
+# Then:  python3 scripts/render_pipeline.py pipeline.yaml --engine java    (or --engine pyspark)
+
+name: orders-enrichment            # pipeline name (Spark app name)
+
+source:                            # where events come from: kafka | file | rate
+  kind: kafka
+  servers: localhost:9092          # Kafka bootstrap servers (or ${KAFKA_BOOTSTRAP_SERVERS})
+  topic: orders                    # topic name; a regex if pattern: true
+  starting_offsets: latest         # latest | earliest
+  payload: json                    # json -> parse value with `schema`; raw -> keep key/value strings
+  schema: "order_id STRING, customer_id STRING, amount DOUBLE, currency STRING, created_at TIMESTAMP"
+  # kafka_options: { security.protocol: SASL_SSL, sasl.mechanism: PLAIN }
+  #
+  # kind: file
+  # path: s3a://landing/orders/    # folder that receives new files
+  # file_format: json              # json | csv | parquet | text
+  # schema: "..."                  # required for json/csv
+
+event_time:                        # optional: needed for dedup, windows and late-data handling
+  column: created_at
+  allowed_lateness: 10 minutes
+
+transform:                         # applied top to bottom; each item is one of:
+  - filter: "amount > 0"
+  - columns: { gross_amount: "round(amount * 1.18, 2)", currency: "upper(currency)" }
+  - lookup: { path: examples/data/customers.csv, format: csv, header: true, join_on: [customer_id], select: [customer_id, segment, city] }
+  # - sql: "SELECT order_id, amount FROM input WHERE currency = 'INR'"   # 'input' = result of the previous item
+  # - dbt: { project: examples/dbt/orders_rules, model: clean_orders }  # business rules from a dbt model
+  # - dedupe: [order_id]                                                # needs event_time
+  # - select: ["order_id", "amount"]
+
+quality:                           # optional row-level checks
+  rules:
+    - { column: order_id, check: not_null }
+    - { column: amount, check: between, min: 0, max: 1000000 }
+    - { column: currency, check: in_set, values: [INR, USD, EUR] }
+  # suite: examples/quality/orders_suite.json   # import a Great Expectations suite
+  on_failure: quarantine           # quarantine | drop | flag | fail
+  quarantine_sink: { kind: file, path: /tmp/quarantine/orders, checkpoint: /tmp/checkpoints/orders-quarantine }
+
+sink:                              # where results go: kafka | file | jdbc | console
+  kind: kafka
+  servers: localhost:9092
+  topic: orders-enriched
+  key_column: order_id
+  checkpoint: /tmp/checkpoints/orders-enriched   # durable path, one per sink
+  trigger: 30 seconds              # "30 seconds" | available_now | omit for as-fast-as-possible
+  #
+  # kind: file  -> path, file_format (parquet), partition_by: [col]
+  # kind: jdbc  -> url, table, user, password (use ${DB_USER}/${DB_PASSWORD}), driver
+  # kind: console

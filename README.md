@@ -12,8 +12,11 @@ source.kafka ──► transform.json ──► transform.lookup ──► trans
 
 - **Built-in components:**
   - **Sources:** Kafka, files (S3/ADLS/GCS/HDFS/local) and rate.
-  - **Transforms:** JSON parsing, SQL, filter, select, derived columns, watermark, dedup, and lookup joins.
+  - **Transforms:** JSON parsing, SQL, filter, select, derived columns, watermark, dedup, lookup joins,
+    **data quality checks** (including Great Expectations suites) and **dbt models**.
   - **Sinks:** Kafka, files (Parquet/JSON/CSV/ORC/Delta), JDBC, console and memory.
+- **A Claude skill** that builds a pipeline from just a source, transformation rules and a sink, described in plain
+  words or as a filled template.
 - **Branching:** any step can read any earlier step, so one source can feed several outputs.
 - **Exactly-once file and Kafka output through checkpoints.** Restarts resume where they stopped.
 - **Secrets from the environment** (`password = ${?DB_PASSWORD}`), never in the file.
@@ -21,6 +24,10 @@ source.kafka ──► transform.json ──► transform.lookup ──► trans
   names the step.
 - **Pluggable:** add your own sources, transforms or sinks without touching this code.
 - **Versions:** Spark 3.5.3, Scala 2.12, Java 11 or 17.
+
+> **Prefer Python?** The same pipelines, with the same config format and options, run on PySpark at
+> **[spark-streaming-pipeline-py](https://github.com/satyaprakashdwivedi/spark-streaming-pipeline-py)**. See
+> [Java or PySpark?](#java-or-pyspark) for when to use which.
 
 ---
 
@@ -151,6 +158,8 @@ Kafka with SASL/SSL:
 | `transform.watermark` | Bounds lateness for stateful steps | `column`; `delay` (`"10 minutes"`) |
 | `transform.dropDuplicates` | Removes repeated events | `columns = [event_id, event_time]`; `withinWatermark` (`false`) |
 | `transform.lookup` | Joins reference data from any batch format (CSV, Parquet, JDBC, Delta, ...) | `format`; `path`; `readerOptions`; `schema`; `on = [key]` or `condition`; `joinType` (`left`); `select`; `broadcast` (`true`); `cache` (`false`) |
+| `transform.quality` | Row-level data quality checks, with bad rows quarantined, dropped, flagged or failing the query | `rules = [...]` and/or `expectationSuite` (a Great Expectations suite file); `onFailure` (`quarantine`); `strictSuiteImport` |
+| `transform.dbt` | Runs a dbt model's SQL inside the stream | `projectDir`; `model`; `compile` (`true`); `compiledSqlPath`; `profilesDir`; `target`; `vars { }`; `streamSchema` (`stream`); `relations { }` |
 
 **Watermark before state.** Aggregations, `dropDuplicates` and stream-stream joins keep state. Put a
 `transform.watermark` step first, or the state grows forever.
@@ -167,6 +176,76 @@ Kafka with SASL/SSL:
                     user = ${?DB_USER}, password = ${?DB_PASSWORD} }
     on = [customer_id], select = [customer_id, segment] } }
 ```
+
+### Data quality: `transform.quality`
+
+```hocon
+{ name = checked, type = transform.quality, options {
+    rules = [
+      { column = order_id, check = not_null }
+      { column = amount,   check = between, min = 0, max = 1000000 }      # strictMin / strictMax optional
+      { column = currency, check = in_set, values = [INR, USD, EUR] }      # also: not_in_set
+      { column = customer_id, check = regex, pattern = "^c-[0-9]{3}$" }    # also: not_regex
+      { column = sku, check = length_between, min = 6, max = 12 }
+      { name = refund_sign, check = sql, condition = "amount >= 0 OR status = 'REFUND'" }
+    ]
+    expectationSuite = "quality/orders_suite.json"   # optional: import a Great Expectations suite
+    onFailure = quarantine                           # quarantine | drop | flag | fail
+} }
+{ name = clean_out,      type = sink.kafka, options { ... } }                       # good rows
+{ name = quarantine_out, type = sink.file, input = checked_quarantine, options { ... } }  # bad rows + reasons
+```
+
+**What happens to bad rows:**
+
+| `onFailure` | Result |
+|---|---|
+| `quarantine` (default) | Good rows continue. Bad rows go to the extra output `<step>_quarantine`, with `_dq_failed_rules` (which rules failed) and `_dq_checked_at`, for any sink. |
+| `drop` | Bad rows are removed. |
+| `flag` | Every row continues, with `_dq_failed_rules` and `_dq_passed` columns. |
+| `fail` | The query stops on the first bad row, and the error names the failed rules. |
+
+**Nulls:** null values pass every check except `not_null`, which is the same convention Great Expectations uses.
+
+**Importing Great Expectations suites:** both the 0.x (`expectation_type`) and 1.x (`type`) suite formats are read.
+These expectations become rules: not null / null, between, in set / not in set, match / not match regex, value
+lengths between / equal.
+
+**Expectations that aren't imported:** table-level ones such as row counts, means and uniqueness need the whole
+dataset, not one row.
+- They're skipped with a warning, or rejected when `strictSuiteImport = true`.
+- To run them per micro-batch with the real Great Expectations library, use the
+  [PySpark version](https://github.com/satyaprakashdwivedi/spark-streaming-pipeline-py).
+- Alternatively, run them in batch on the landed data.
+
+### Business rules in dbt: `transform.dbt`
+
+Keep transformation rules (CASE logic, mappings, macros, variables) in a dbt project, and run them in the stream.
+
+```hocon
+{ name = rules, type = transform.dbt, options {
+    projectDir = "dbt/orders_rules", model = clean_orders
+    profilesDir = "dbt/orders_rules", vars { min_amount = 500 }   # passed to dbt compile
+} }
+```
+
+The model reads the data flowing into the step as `{{ source('stream', 'input') }}`. Declare that source in
+`sources.yml` with `schema: stream`. See [`examples/dbt/orders_rules`](examples/dbt/orders_rules).
+
+**At start-up, the step:**
+1. runs `dbt compile --select <model>` (install with `pip install "dbt-spark[session]"`);
+2. takes the compiled SQL, with macros and variables already resolved;
+3. points `stream.<name>` at the pipeline's data;
+4. runs it as streaming SQL.
+
+**Compiling in CI instead:** set `compile = false` with `compiledSqlPath` (or a `target/compiled` folder), so the
+cluster doesn't need dbt installed.
+
+**Limits:**
+- The SQL must be streaming-compatible: no ORDER BY or LIMIT without aggregation, and aggregations need a
+  `transform.watermark` first.
+- dbt tests don't run on the stream. Use `transform.quality`.
+- For heavy modelling, land the stream (bronze) and run dbt incremental models on it in batch.
 
 ### Sinks
 
@@ -229,6 +308,66 @@ What happens to the sample data:
 
 ---
 
+## Claude skill: build a pipeline from source + rules + sink
+
+[`skill/spark-pipeline-builder`](skill/spark-pipeline-builder) is a Claude skill for Claude Code, Claude Desktop or
+the API.
+
+**You give it:**
+- a plain-language description, such as *"Kafka orders topic, drop amounts ≤ 0, enrich with customers.csv, check
+  order_id is not null, write Parquet to S3"*;
+- or a filled-in [`templates/pipeline.yaml`](skill/spark-pipeline-builder/templates/pipeline.yaml).
+
+**It then:**
+1. asks only for what's missing, such as the schema or checkpoint paths;
+2. renders the full config;
+3. validates it;
+4. optionally runs it locally;
+5. gives you the `spark-submit` command.
+
+**One template, both engines:** `--engine java` produces HOCON for this repo, and `--engine pyspark` produces YAML
+for the PySpark repo.
+
+```bash
+# install for Claude Code (personal skill)
+cp -r skill/spark-pipeline-builder ~/.claude/skills/
+
+# or use the renderer directly
+pip install pyyaml
+python3 skill/spark-pipeline-builder/scripts/render_pipeline.py my-pipeline.yaml --engine java --out my-pipeline.conf
+mvn -Plocal compile exec:exec -Dpipeline="my-pipeline.conf --validate"
+```
+
+Template in brief:
+
+```yaml
+source:    { kind: kafka, servers: localhost:9092, topic: orders, schema: "order_id STRING, amount DOUBLE, ..." }
+event_time: { column: created_at, allowed_lateness: 10 minutes }
+transform:
+  - filter: "amount > 0"
+  - lookup: { path: ref/customers.csv, format: csv, header: true, join_on: [customer_id] }
+  - dbt: { project: dbt/orders_rules, model: clean_orders }
+quality:   { suite: quality/orders_suite.json, on_failure: quarantine,
+             quarantine_sink: { kind: file, path: s3a://dq/orders, checkpoint: s3a://chk/orders-dq } }
+sink:      { kind: kafka, servers: localhost:9092, topic: orders-clean, checkpoint: s3a://chk/orders-clean }
+```
+
+## Java or PySpark?
+
+Both repos run the **same pipeline configs**: the same step types, options and template. Both run on the same
+Spark engine, so they scale the same way: Kafka partitions, executors and micro-batches. Pick by team and ecosystem.
+
+| Use **this Java repo** when | Use **[spark-streaming-pipeline-py](https://github.com/satyaprakashdwivedi/spark-streaming-pipeline-py)** when |
+|---|---|
+| Your platform is JVM-first (Scala/Java teams, existing jars, YARN) | Your team works in Python, or on Databricks notebooks and jobs |
+| You want one small jar for `spark-submit` | You need Python libraries in the stream: pandas UDFs, ML models (scikit-learn, PyTorch), custom Python logic |
+| Row-level quality checks are enough | You want **real Great Expectations** validation per micro-batch, including table-level expectations, with results you can act on |
+| Strong typing for custom components | Python functions as custom components, with no build step |
+
+**Why the PySpark repo exists:** Great Expectations is a Python library, and so is most of the data-science
+ecosystem. Running them inside a JVM job isn't practical. The PySpark repo gives Python teams the same
+config-driven pipelines, and adds what only Python can do well, without forking the config format.
+
 ## Adding your own component
 
 Implement `Source`, `Transform` or `Sink`, then register it in one of two ways.
@@ -272,8 +411,11 @@ src/main/java/io/github/satyaprakashdwivedi/streaming/
   registry/ComponentRegistry   type name -> implementation, built-ins and plug-ins
   runtime/                     PipelineRunner (validate, wire, start), RunningPipeline
   components/sources|transforms|sinks/   the built-in components
+  components/quality/          transform.quality and the Great Expectations suite import
+  components/dbt/              transform.dbt
 src/test/java/...              config/validation tests and end-to-end streaming tests (local Spark)
-examples/                      ready-to-run pipelines and sample data
+examples/                      ready-to-run pipelines, sample data, a dbt project and a Great Expectations suite
+skill/spark-pipeline-builder/  Claude skill: template, renderer, tests
 docker-compose.yml             local Kafka and PostgreSQL
 ```
 
@@ -283,7 +425,8 @@ docker-compose.yml             local Kafka and PostgreSQL
 mvn test
 ```
 
-- **What runs:** 21 tests. Config parsing and validation, plus real streaming queries on a local Spark session.
+- **What runs:** 31 Java tests, plus 7 Python tests for the skill's template renderer
+  (`python -m unittest discover -s skill/spark-pipeline-builder/tests`). Config parsing and validation, plus real streaming queries on a local Spark session.
 - **What they cover:**
   - JSON parsing, including malformed rows;
   - filters, derived columns and SQL;
@@ -291,7 +434,9 @@ mvn test
   - branching to two sinks;
   - the Parquet sink resuming from its checkpoint;
   - dedup with a watermark;
-  - custom components.
+  - custom components;
+  - all four quality modes and the Great Expectations suite import;
+  - dbt compile, run through a stand-in `dbt` command so CI doesn't need dbt installed.
 - **No broker needed:** the Kafka source is checked for its wiring and output columns.
 - **CI:** the GitHub Actions workflow runs the suite on Java 11 and 17.
 

@@ -1,0 +1,8 @@
+name: orders_rules
+version: "1.0.0"
+config-version: 2
+profile: orders_rules
+model-paths: ["models"]
+target-path: target
+vars:
+  min_amount: 0

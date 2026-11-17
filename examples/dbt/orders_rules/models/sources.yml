@@ -1,0 +1,6 @@
+version: 2
+sources:
+  - name: stream          # the pipeline's streaming data, read as source('stream', 'input')
+    schema: stream
+    tables:
+      - name: input   # the data flowing into the transform.dbt step

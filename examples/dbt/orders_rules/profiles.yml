@@ -1,0 +1,9 @@
+# Compiling needs only a Spark adapter; "session" runs Spark in-process (pip install "dbt-spark[session]").
+orders_rules:
+  target: dev
+  outputs:
+    dev:
+      type: spark
+      method: session
+      schema: analytics
+      host: NA

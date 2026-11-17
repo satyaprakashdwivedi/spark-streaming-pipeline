@@ -5,6 +5,8 @@ import io.github.satyaprakashdwivedi.streaming.api.ComponentProvider;
 import io.github.satyaprakashdwivedi.streaming.api.Sink;
 import io.github.satyaprakashdwivedi.streaming.api.Source;
 import io.github.satyaprakashdwivedi.streaming.api.Transform;
+import io.github.satyaprakashdwivedi.streaming.components.dbt.DbtModelTransform;
+import io.github.satyaprakashdwivedi.streaming.components.quality.QualityTransform;
 import io.github.satyaprakashdwivedi.streaming.components.sinks.ConsoleSink;
 import io.github.satyaprakashdwivedi.streaming.components.sinks.FileSink;
 import io.github.satyaprakashdwivedi.streaming.components.sinks.JdbcSink;
@@ -47,6 +49,8 @@ public final class ComponentRegistry {
         r.transform("transform.watermark", new WatermarkTransform());
         r.transform("transform.dropDuplicates", new DropDuplicatesTransform());
         r.transform("transform.lookup", new LookupJoinTransform());
+        r.transform("transform.quality", new QualityTransform());
+        r.transform("transform.dbt", new DbtModelTransform());
 
         r.sink("sink.console", new ConsoleSink());
         r.sink("sink.kafka", new KafkaSink());
